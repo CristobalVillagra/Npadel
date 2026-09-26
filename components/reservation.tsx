@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   CalendarDays,
   Clock,
@@ -13,18 +13,8 @@ import {
 import { cn } from '@/lib/utils'
 import { getSupabaseClient } from '@/lib/supabase/client'
 
-/**
- * Estructura preparada para recibir posteriormente la cantidad real
- * de canchas y sus nombres (o conectarse a un backend / Google Calendar).
- * No se inventan nombres como "Cancha 1", "Cancha 2".
- */
-type Court = { id: string; label: string; type: 'exterior' | 'techada' }
-const COURTS: Court[] = [
-  { id: 'exterior', label: 'Cancha exterior', type: 'exterior' },
-  { id: 'techada-1', label: 'Cancha techada 1', type: 'techada' },
-  { id: 'techada-2', label: 'Cancha techada 2', type: 'techada' },
-  { id: 'techada-3', label: 'Cancha techada 3', type: 'techada' },
-]
+type Court = { id: string; nombre: string; tipo: 'exterior' | 'techada' }
+type Tariff = { dia_tipo: 'semana' | 'fin_semana'; hora_inicio: string; hora_fin: string; monto: number }
 
 const STEPS = ['Fecha', 'Horario', 'Cancha', 'Tus datos', 'Confirmación'] as const
 
@@ -43,18 +33,14 @@ function buildDays(anchorDate: string, count = 14) {
 function buildSlots(date: Date) {
   const day = date.getUTCDay() // 0 dom, 6 sáb
   const isWeekend = day === 0 || day === 6
-  const startHour = isWeekend ? 9 : 7
-  const startMin = isWeekend ? 0 : 0
-  const closeMinutes = 22 * 60 + 30 // 22:30
-  const slots: string[] = []
-  let t = startHour * 60 + startMin
-  while (t + 90 <= closeMinutes) {
-    const h = Math.floor(t / 60)
-    const m = t % 60
-    slots.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`)
-    t += 90
-  }
-  return slots
+  return isWeekend
+    ? ['09:00', '10:30', '12:00', '13:30', '15:00', '16:30', '18:00', '19:30', '21:00']
+    : ['07:00', '08:30', '10:00', '11:30', '13:00', '15:30', '17:00', '18:30', '20:00', '21:30']
+}
+
+function timeToMinutes(value: string) {
+  const [hours, minutes] = value.slice(0, 5).split(':').map(Number)
+  return hours * 60 + minutes
 }
 
 const dateFormatOptions = { timeZone: 'UTC' } as const
@@ -75,10 +61,11 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
   const [step, setStep] = useState(0)
   const [date, setDate] = useState<Date | null>(null)
   const [time, setTime] = useState<string | null>(null)
-  const [duration, setDuration] = useState<60 | 90>(60)
-  const [court, setCourt] = useState<Court | null>(
-    COURTS.length === 1 ? COURTS[0] : null,
-  )
+  const [court, setCourt] = useState<Court | null>(null)
+  const [courts, setCourts] = useState<Court[]>([])
+  const [tariffs, setTariffs] = useState<Tariff[]>([])
+  const [courtsError, setCourtsError] = useState<string | null>(null)
+  const [loadingCourts, setLoadingCourts] = useState(true)
   const [name, setName] = useState('')
   const [phone, setPhone] = useState('')
   const [email, setEmail] = useState('')
@@ -89,8 +76,36 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
   const [reservationId, setReservationId] = useState<string | null>(null)
   const [paymentState, setPaymentState] = useState<'idle' | 'confirming' | 'confirmed' | 'cancelled' | 'error'>('idle')
   const [processing, setProcessing] = useState(false)
+  const [attemptedNext, setAttemptedNext] = useState(false)
+  const [touched, setTouched] = useState<Record<string, boolean>>({})
+  const nameInput = useRef<HTMLInputElement>(null)
+  const phoneInput = useRef<HTMLInputElement>(null)
+  const partnerNameInput = useRef<HTMLInputElement>(null)
+  const partnerPhoneInput = useRef<HTMLInputElement>(null)
 
   const days = useMemo(() => buildDays(anchorDate, 14), [anchorDate])
+
+  useEffect(() => {
+    let active = true
+    const loadBookingData = async () => {
+      const supabase = getSupabaseClient()
+      const [courtsResult, tariffsResult] = await Promise.all([
+        supabase.from('canchas').select('id, nombre, tipo').eq('activa', true).order('nombre'),
+        supabase.from('tarifas').select('dia_tipo, hora_inicio, hora_fin, monto'),
+      ])
+      if (!active) return
+      if (courtsResult.error) {
+        setCourtsError('No pudimos cargar las canchas. Intenta nuevamente.')
+      } else {
+        setCourts(courtsResult.data as Court[])
+        if (courtsResult.data.length === 1) setCourt(courtsResult.data[0] as Court)
+      }
+      if (!tariffsResult.error) setTariffs(tariffsResult.data as Tariff[])
+      setLoadingCourts(false)
+    }
+    loadBookingData()
+    return () => { active = false }
+  }, [])
 
   useEffect(() => {
     if (initialReservationId) {
@@ -99,16 +114,29 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
     }
   }, [initialReservationId])
   const slots = useMemo(() => (date ? buildSlots(date) : []), [date])
+  const dayType = date && (date.getUTCDay() === 0 || date.getUTCDay() === 6) ? 'fin_semana' : 'semana'
+  const tariffFor = (slot: string) => tariffs.find((tariff) =>
+    tariff.dia_tipo === dayType && timeToMinutes(slot) >= timeToMinutes(tariff.hora_inicio) && timeToMinutes(slot) < timeToMinutes(tariff.hora_fin),
+  )
+  const fieldErrors = {
+    name: name.trim().length > 1 ? '' : 'Campo obligatorio',
+    phone: phone.trim().length >= 8 ? '' : 'Campo obligatorio',
+    partnerName: !hasPartner || partnerName.trim().length > 1 ? '' : 'Campo obligatorio',
+    partnerPhone: !hasPartner || partnerPhone.trim().length >= 8 ? '' : 'Campo obligatorio',
+  }
 
   useEffect(() => {
     if (!reservationId || paymentState !== 'confirming') return
     let active = true
     const checkStatus = async () => {
-      const response = await fetch(`/api/reservas/${reservationId}/status`, { cache: 'no-store' })
-      if (!response.ok || !active) return
-      const result = await response.json()
-      if (result.estado === 'confirmada') setPaymentState('confirmed')
-      if (result.estado === 'cancelada') setPaymentState('cancelled')
+      const { data } = await (getSupabaseClient() as any)
+        .from('estado_reserva')
+        .select('estado')
+        .eq('id', reservationId)
+        .maybeSingle()
+      if (!active || !data) return
+      if (data.estado === 'confirmada') setPaymentState('confirmed')
+      if (data.estado === 'cancelada') setPaymentState('cancelled')
     }
     checkStatus()
     const interval = window.setInterval(checkStatus, 2500)
@@ -119,27 +147,23 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
     (step === 0 && !!date) ||
     (step === 1 && !!time) ||
     (step === 2 && !!court) ||
-    (step === 3 && name.trim().length > 1 && phone.trim().length >= 8 &&
-      (!hasPartner || (partnerName.trim().length > 1 && partnerPhone.trim().length >= 8)))
+    (step === 3 && !Object.values(fieldErrors).some(Boolean))
 
   async function submitReservation() {
     if (!date || !time || !court || !name.trim() || !phone.trim()) return
     setProcessing(true)
-    const supabase = getSupabaseClient()
-    const { data: courtRow } = await supabase.from('canchas').select('id').eq('nombre', court.label).maybeSingle()
-    if (!courtRow) {
-      setProcessing(false)
-      setStep(2)
-      return
-    }
+    const supabase = getSupabaseClient() as any
     const [hours, minutes] = time.split(':').map(Number)
     const start = new Date(date)
     start.setUTCHours(hours, minutes, 0, 0)
-    const end = new Date(start.getTime() + duration * 60 * 1000)
-    const { data: reservation, error } = await supabase.from('reservas').insert({
-      cancha_id: courtRow.id,
-      fecha: anchorDate,
+    const end = new Date(start.getTime() + 90 * 60 * 1000)
+    const tariff = tariffFor(time)
+    const newReservationId = crypto.randomUUID()
+    const { error } = await supabase.from('reservas').insert({
+      id: newReservationId,
+      cancha_id: court.id,
       rango_horario: `[${start.toISOString()},${end.toISOString()})`,
+      duracion_minutos: 90,
       cliente_nombre: name.trim(),
       cliente_telefono: phone.trim(),
       cliente_email: email.trim() || null,
@@ -147,9 +171,9 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
       partner_nombre: hasPartner ? partnerName.trim() : null,
       partner_telefono: hasPartner ? partnerPhone.trim() : null,
       estado: 'pendiente',
-      monto: duration === 60 ? 40000 : 55000,
-    }).select('id').single()
-    if (error || !reservation) {
+      monto: tariff?.monto ?? 0,
+    })
+    if (error) {
       setProcessing(false)
       setStep(1)
       setTime(null)
@@ -158,16 +182,16 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
     const checkout = await fetch('/api/mercadopago/create-preference', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reservationId: reservation.id, amount: duration === 60 ? 40000 : 55000 }),
+      body: JSON.stringify({ reservationId: newReservationId, amount: tariff?.monto ?? 0 }),
     })
     const checkoutData = await checkout.json().catch(() => ({}))
     setProcessing(false)
     if (!checkout.ok || !checkoutData.initPoint) {
       setPaymentState('error')
-      setReservationId(reservation.id)
+      setReservationId(newReservationId)
       return
     }
-    setReservationId(reservation.id)
+    setReservationId(newReservationId)
     setPaymentState('confirming')
     window.location.assign(checkoutData.initPoint)
   }
@@ -176,7 +200,7 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
     setStep(0)
     setDate(null)
     setTime(null)
-    setCourt(COURTS.length === 1 ? COURTS[0] : null)
+    setCourt(courts.length === 1 ? courts[0] : null)
     setName('')
     setPhone('')
     setEmail('')
@@ -187,6 +211,8 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
     setReservationId(null)
     setPaymentState('idle')
     setProcessing(false)
+    setAttemptedNext(false)
+    setTouched({})
   }
 
   return (
@@ -276,7 +302,7 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
                     </li>
                     <li className="flex items-center gap-2">
                       <MapPin className="h-4 w-4 text-primary" />
-                      <span>{court?.label}</span>
+                      <span>{court ? `${court.nombre} — ${court.tipo === 'exterior' ? 'Exterior' : 'Techada'}` : '—'}</span>
                     </li>
                     <li className="flex items-center gap-2">
                       <Users className="h-4 w-4 text-primary" />
@@ -309,13 +335,7 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
                     <h3 className="mb-4 font-display text-xl font-bold">
                       Selecciona una fecha
                     </h3>
-                    <div className="mb-5 grid gap-3 sm:grid-cols-2">
-                      {[{ value: 60 as const, label: '1 hora', price: '$40.000 CLP' }, { value: 90 as const, label: '1 hora 30 min', price: '$55.000 CLP' }].map((option) => (
-                        <button key={option.value} type="button" onClick={() => setDuration(option.value)} className={cn('rounded-xl border px-4 py-3 text-left transition-all', duration === option.value ? 'border-primary bg-primary/10' : 'border-border hover:border-primary/50')}>
-                          <span className="block font-bold">{option.label}</span><span className="text-sm text-muted-foreground">{option.price}</span>
-                        </button>
-                      ))}
-                    </div>
+                    <p className="mb-5 text-sm text-muted-foreground">Todos los turnos duran 90 minutos.</p>
                     <div className="grid grid-cols-3 gap-2 sm:grid-cols-5 md:grid-cols-7">
                       {days.map((d) => {
                         const selected =
@@ -379,6 +399,8 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
                     <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-5">
                       {slots.map((s) => {
                         const selected = time === s
+                        const tariff = tariffFor(s)
+                        const highTariff = tariff && timeToMinutes(tariff.hora_inicio) >= 17 * 60
                         return (
                           <button
                             key={s}
@@ -391,7 +413,9 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
                                 : 'border-border bg-background hover:border-primary/50',
                             )}
                           >
-                            {s}
+                            <span className="block">{s}</span>
+                            {tariff && <span className="mt-1 block text-xs font-medium">${tariff.monto.toLocaleString('es-CL')}</span>}
+                            {highTariff && <span className="mt-1 inline-block rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-bold text-amber-800 dark:text-amber-300">Tarifa alta</span>}
                           </button>
                         )
                       })}
@@ -408,8 +432,14 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
                     <h3 className="mb-4 font-display text-xl font-bold">
                       Selecciona la cancha
                     </h3>
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      {COURTS.map((c) => {
+                    {loadingCourts ? (
+                      <p className="text-sm text-muted-foreground">Cargando canchas…</p>
+                    ) : courtsError ? (
+                      <p role="alert" className="text-sm text-destructive">{courtsError}</p>
+                    ) : courts.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">No hay canchas disponibles por el momento.</p>
+                    ) : <div className="grid gap-3 sm:grid-cols-2">
+                      {courts.map((c) => {
                         const selected = court?.id === c.id
                         return (
                           <button
@@ -435,15 +465,14 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
                                 <MapPin className="h-5 w-5" />
                               </span>
                               <span>
-                                <span className="block font-bold">{c.label}</span>
-                                <span className="mt-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">{c.type}</span>
+                                <span className="block font-bold">{c.nombre} — {c.tipo === 'exterior' ? 'Exterior' : 'Techada'}</span>
                               </span>
                             </span>
                             {selected && <Check className="h-5 w-5 text-primary" />}
                           </button>
                         )
                       })}
-                    </div>
+                    </div>}
                   </div>
                 )}
 
@@ -452,21 +481,27 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
                   <div>
                     <h3 className="mb-4 font-display text-xl font-bold">Tus datos</h3>
                     <div className="grid gap-4 sm:grid-cols-2">
-                      <Field label="Nombre" required>
+                      <Field label="Nombre" required error={(attemptedNext || touched.name) ? fieldErrors.name : ''}>
                         <input
+                          ref={nameInput}
                           value={name}
                           onChange={(e) => setName(e.target.value)}
+                          onBlur={() => setTouched((current) => ({ ...current, name: true }))}
+                          aria-invalid={Boolean((attemptedNext || touched.name) && fieldErrors.name)}
                           placeholder="Tu nombre"
-                          className="w-full rounded-lg border border-border bg-background px-4 py-2.5 text-sm outline-none transition-colors focus:border-primary"
+                          className={cn('w-full rounded-lg border bg-background px-4 py-2.5 text-sm outline-none transition-colors focus:border-primary', (attemptedNext || touched.name) && fieldErrors.name ? 'border-destructive' : 'border-border')}
                         />
                       </Field>
-                      <Field label="Teléfono / WhatsApp" required>
+                      <Field label="Teléfono / WhatsApp" required error={(attemptedNext || touched.phone) ? fieldErrors.phone : ''}>
                         <input
+                          ref={phoneInput}
                           value={phone}
                           onChange={(e) => setPhone(e.target.value)}
+                          onBlur={() => setTouched((current) => ({ ...current, phone: true }))}
+                          aria-invalid={Boolean((attemptedNext || touched.phone) && fieldErrors.phone)}
                           inputMode="tel"
                           placeholder="+56 9 ..."
-                          className="w-full rounded-lg border border-border bg-background px-4 py-2.5 text-sm outline-none transition-colors focus:border-primary"
+                          className={cn('w-full rounded-lg border bg-background px-4 py-2.5 text-sm outline-none transition-colors focus:border-primary', (attemptedNext || touched.phone) && fieldErrors.phone ? 'border-destructive' : 'border-border')}
                         />
                       </Field>
                       <Field label="Correo electrónico (opcional)">
@@ -496,11 +531,11 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
                         </label>
                         {hasPartner && (
                           <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                            <Field label="Nombre del partner" required>
-                              <input value={partnerName} onChange={(e) => setPartnerName(e.target.value)} placeholder="Nombre del partner" className="w-full rounded-lg border border-border bg-background px-4 py-2.5 text-sm outline-none focus:border-primary" />
+                            <Field label="Nombre del partner" required error={(attemptedNext || touched.partnerName) ? fieldErrors.partnerName : ''}>
+                              <input ref={partnerNameInput} value={partnerName} onChange={(e) => setPartnerName(e.target.value)} onBlur={() => setTouched((current) => ({ ...current, partnerName: true }))} aria-invalid={Boolean((attemptedNext || touched.partnerName) && fieldErrors.partnerName)} placeholder="Nombre del partner" className={cn('w-full rounded-lg border bg-background px-4 py-2.5 text-sm outline-none focus:border-primary', (attemptedNext || touched.partnerName) && fieldErrors.partnerName ? 'border-destructive' : 'border-border')} />
                             </Field>
-                            <Field label="Teléfono del partner" required>
-                              <input value={partnerPhone} onChange={(e) => setPartnerPhone(e.target.value)} inputMode="tel" placeholder="+56 9 ..." className="w-full rounded-lg border border-border bg-background px-4 py-2.5 text-sm outline-none focus:border-primary" />
+                            <Field label="Teléfono del partner" required error={(attemptedNext || touched.partnerPhone) ? fieldErrors.partnerPhone : ''}>
+                              <input ref={partnerPhoneInput} value={partnerPhone} onChange={(e) => setPartnerPhone(e.target.value)} onBlur={() => setTouched((current) => ({ ...current, partnerPhone: true }))} aria-invalid={Boolean((attemptedNext || touched.partnerPhone) && fieldErrors.partnerPhone)} inputMode="tel" placeholder="+56 9 ..." className={cn('w-full rounded-lg border bg-background px-4 py-2.5 text-sm outline-none focus:border-primary', (attemptedNext || touched.partnerPhone) && fieldErrors.partnerPhone ? 'border-destructive' : 'border-border')} />
                             </Field>
                           </div>
                         )}
@@ -542,11 +577,18 @@ export function Reservation({ anchorDate, initialReservationId }: { anchorDate: 
                   ) : (
                     <button
                       type="button"
-                  disabled={!canNext || processing}
-                  onClick={submitReservation}
+                  disabled={processing}
+                  onClick={() => {
+                    setAttemptedNext(true)
+                    if (fieldErrors.name) return nameInput.current?.focus()
+                    if (fieldErrors.phone) return phoneInput.current?.focus()
+                    if (fieldErrors.partnerName) return partnerNameInput.current?.focus()
+                    if (fieldErrors.partnerPhone) return partnerPhoneInput.current?.focus()
+                    submitReservation()
+                  }}
                       className={cn(
                         'inline-flex items-center gap-1 rounded-lg bg-primary px-6 py-2.5 text-sm font-bold text-primary-foreground transition-all',
-                        canNext ? 'hover:brightness-110' : 'cursor-not-allowed opacity-40',
+                        processing ? 'cursor-not-allowed opacity-40' : 'hover:brightness-110',
                       )}
                     >
                       Confirmar reserva
@@ -568,11 +610,13 @@ function Field({
   required,
   help,
   children,
+  error,
 }: {
   label: string
   required?: boolean
   help?: string
   children: React.ReactNode
+  error?: string
 }) {
   return (
     <label className="block">
@@ -581,6 +625,7 @@ function Field({
         {required && <span className="ml-1 text-primary">*</span>}
       </span>
       {children}
+      {error && <span role="alert" className="mt-1.5 block text-xs text-destructive">{error}</span>}
       {help && <span className="mt-1.5 block text-xs leading-5 text-muted-foreground">{help}</span>}
     </label>
   )
